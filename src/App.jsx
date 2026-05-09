@@ -139,23 +139,32 @@ const fetchSpotifyTrack = async (trackId, clientId, clientSecret) => {
 
 const fetchRandomFromPlaylist = async (playlistId, clientId, clientSecret) => {
   const token = await getAccessToken(clientId, clientSecret);
-  // First get playlist total
-  const infoRes = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}?fields=tracks.total,name`, { headers: { Authorization: `Bearer ${token}` } });
-  if (!infoRes.ok) throw new Error("Playlist niet gevonden.");
+  // Get playlist info — geen fields filter zodat we zeker de juiste structuur krijgen
+  const infoRes = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}`, { headers: { Authorization: `Bearer ${token}` } });
+  if (!infoRes.ok) throw new Error("Playlist niet gevonden. Is de playlist publiek?");
   const info = await infoRes.json();
-  const total = info.tracks.total;
-  if (total === 0) throw new Error("Playlist is leeg.");
+  const total = info?.tracks?.total;
+  if (!total || total === 0) throw new Error("Playlist is leeg of niet toegankelijk.");
   // Pick random offset
   const offset = Math.floor(Math.random() * total);
-  const tracksRes = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=1&offset=${offset}&fields=items(track(id,name,artists,album,preview_url))`, { headers: { Authorization: `Bearer ${token}` } });
+  const tracksRes = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=1&offset=${offset}`, { headers: { Authorization: `Bearer ${token}` } });
   if (!tracksRes.ok) throw new Error("Kon tracks niet laden.");
   const data = await tracksRes.json();
   const item = data.items?.[0]?.track;
-  if (!item) throw new Error("Geen track gevonden op deze positie.");
-  // Fetch full track for album release date
-  const fullRes = await fetch(`https://api.spotify.com/v1/tracks/${item.id}`, { headers: { Authorization: `Bearer ${token}` } });
-  if (!fullRes.ok) throw new Error("Track details niet gevonden.");
-  return { track: trackToData(await fullRes.json()), playlistName: info.name, playlistTotal: total };
+  if (!item || !item.id) throw new Error("Geen geldige track. Probeer opnieuw.");
+  return {
+    track: {
+      id: item.id,
+      title: item.name,
+      artist: item.artists?.map(a => a.name).join(", ") || "Onbekend",
+      album: item.album?.name || "",
+      cover: item.album?.images?.[0]?.url || null,
+      previewUrl: item.preview_url || null,
+      year: item.album?.release_date?.slice(0, 4) || null,
+    },
+    playlistName: info.name,
+    playlistTotal: total,
+  };
 };
 
 // ── CONSTANTS ─────────────────────────────────────────────────────────────
