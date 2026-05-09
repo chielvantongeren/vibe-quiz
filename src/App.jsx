@@ -105,15 +105,57 @@ const loadBank = () => {
 };
 
 // ── SPOTIFY ───────────────────────────────────────────────────────────────
-const extractSpotifyId = (input) => { if (!input) return null; const m = input.match(/track\/([A-Za-z0-9]+)/); if (m) return m[1]; if (/^[A-Za-z0-9]{22}$/.test(input.trim())) return input.trim(); return null; };
-const fetchSpotifyTrack = async (trackId, clientId, clientSecret) => {
+const extractSpotifyId = (input) => {
+  if (!input) return null;
+  // Strip query params and whitespace
+  const clean = input.trim().split("?")[0].split("#")[0];
+  const trackMatch = clean.match(/track\/([A-Za-z0-9]+)/);
+  if (trackMatch) return { type: "track", id: trackMatch[1] };
+  const playlistMatch = clean.match(/playlist\/([A-Za-z0-9]+)/);
+  if (playlistMatch) return { type: "playlist", id: playlistMatch[1] };
+  if (/^[A-Za-z0-9]{22}$/.test(clean)) return { type: "track", id: clean };
+  return null;
+};
+
+const getAccessToken = async (clientId, clientSecret) => {
   const tokenRes = await fetch("https://accounts.spotify.com/api/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", "Authorization": "Basic " + btoa(clientId + ":" + clientSecret) }, body: "grant_type=client_credentials" });
-  if (!tokenRes.ok) throw new Error("Token mislukt.");
+  if (!tokenRes.ok) throw new Error("Token mislukt — controleer je credentials.");
   const { access_token } = await tokenRes.json();
-  const trackRes = await fetch(`https://api.spotify.com/v1/tracks/${trackId}`, { headers: { Authorization: `Bearer ${access_token}` } });
+  return access_token;
+};
+
+const trackToData = (d) => ({
+  id: d.id, title: d.name, artist: d.artists.map(a => a.name).join(", "),
+  album: d.album.name, cover: d.album.images[0]?.url,
+  previewUrl: d.preview_url, year: d.album.release_date?.slice(0, 4)
+});
+
+const fetchSpotifyTrack = async (trackId, clientId, clientSecret) => {
+  const token = await getAccessToken(clientId, clientSecret);
+  const trackRes = await fetch(`https://api.spotify.com/v1/tracks/${trackId}`, { headers: { Authorization: `Bearer ${token}` } });
   if (!trackRes.ok) throw new Error("Track niet gevonden.");
-  const d = await trackRes.json();
-  return { id: d.id, title: d.name, artist: d.artists.map(a => a.name).join(", "), album: d.album.name, cover: d.album.images[0]?.url, previewUrl: d.preview_url, year: d.album.release_date?.slice(0, 4) };
+  return trackToData(await trackRes.json());
+};
+
+const fetchRandomFromPlaylist = async (playlistId, clientId, clientSecret) => {
+  const token = await getAccessToken(clientId, clientSecret);
+  // First get playlist total
+  const infoRes = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}?fields=tracks.total,name`, { headers: { Authorization: `Bearer ${token}` } });
+  if (!infoRes.ok) throw new Error("Playlist niet gevonden.");
+  const info = await infoRes.json();
+  const total = info.tracks.total;
+  if (total === 0) throw new Error("Playlist is leeg.");
+  // Pick random offset
+  const offset = Math.floor(Math.random() * total);
+  const tracksRes = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=1&offset=${offset}&fields=items(track(id,name,artists,album,preview_url))`, { headers: { Authorization: `Bearer ${token}` } });
+  if (!tracksRes.ok) throw new Error("Kon tracks niet laden.");
+  const data = await tracksRes.json();
+  const item = data.items?.[0]?.track;
+  if (!item) throw new Error("Geen track gevonden op deze positie.");
+  // Fetch full track for album release date
+  const fullRes = await fetch(`https://api.spotify.com/v1/tracks/${item.id}`, { headers: { Authorization: `Bearer ${token}` } });
+  if (!fullRes.ok) throw new Error("Track details niet gevonden.");
+  return { track: trackToData(await fullRes.json()), playlistName: info.name, playlistTotal: total };
 };
 
 // ── CONSTANTS ─────────────────────────────────────────────────────────────
@@ -914,7 +956,47 @@ function QuestionForm({ initial, type, onSave, onCancel }) {
 
 function SpotifyAdder({ spotifyCreds, onAdd, onCancel }) {
   const [url, setUrl] = useState(""); const [loading, setLoading] = useState(false); const [error, setError] = useState(""); const [track, setTrack] = useState(null); const [playing, setPlaying] = useState(false); const [qText, setQText] = useState(""); const [options, setOptions] = useState(["", "", "", ""]); const [answer, setAnswer] = useState(0); const audioRef = useRef(null);
-  const lookup = async () => { const id = extractSpotifyId(url); if (!id) { setError("Geen geldige URL of ID."); return; } if (!spotifyCreds.clientId) { setError("Spotify credentials ontbreken."); return; } setLoading(true); setError(""); setTrack(null); try { const t = await fetchSpotifyTrack(id, spotifyCreds.clientId, spotifyCreds.clientSecret); setTrack(t); setQText(`🎵 Welk jaar verscheen "${t.title}" van ${t.artist}?`); const yr = parseInt(t.year); if (yr) { const pool = [yr - 3, yr - 2, yr - 1, yr, yr + 1, yr + 2].filter(y => y > 1950 && y <= new Date().getFullYear()); const wrong = pool.filter(y => y !== yr).sort(() => Math.random() - 0.5).slice(0, 3); const opts = [...wrong, yr].sort(() => Math.random() - 0.5); setOptions(opts.map(String)); setAnswer(opts.indexOf(yr)); } } catch (e) { setError(e.message); } setLoading(false); };
+  const [playlistInfo, setPlaylistInfo] = useState(null);
+
+  const buildYearOptions = (yr) => {
+    const pool = [yr - 3, yr - 2, yr - 1, yr, yr + 1, yr + 2].filter(y => y > 1950 && y <= new Date().getFullYear());
+    const wrong = pool.filter(y => y !== yr).sort(() => Math.random() - 0.5).slice(0, 3);
+    const opts = [...wrong, yr].sort(() => Math.random() - 0.5);
+    setOptions(opts.map(String)); setAnswer(opts.indexOf(yr));
+  };
+
+  const lookup = async () => {
+    const parsed = extractSpotifyId(url);
+    if (!parsed) { setError("Geen geldige Spotify URL of ID."); return; }
+    if (!spotifyCreds.clientId) { setError("Spotify credentials ontbreken."); return; }
+    setLoading(true); setError(""); setTrack(null); setPlaylistInfo(null);
+    try {
+      if (parsed.type === "track") {
+        const t = await fetchSpotifyTrack(parsed.id, spotifyCreds.clientId, spotifyCreds.clientSecret);
+        setTrack(t);
+        setQText(`🎵 Welk jaar verscheen "${t.title}" van ${t.artist}?`);
+        if (t.year) buildYearOptions(parseInt(t.year));
+      } else {
+        const { track: t, playlistName, playlistTotal } = await fetchRandomFromPlaylist(parsed.id, spotifyCreds.clientId, spotifyCreds.clientSecret);
+        setTrack(t); setPlaylistInfo({ name: playlistName, total: playlistTotal, id: parsed.id });
+        setQText(`🎵 Welk jaar verscheen "${t.title}" van ${t.artist}?`);
+        if (t.year) buildYearOptions(parseInt(t.year));
+      }
+    } catch (e) { setError(e.message); }
+    setLoading(false);
+  };
+
+  const pickAnother = async () => {
+    if (!playlistInfo) return;
+    setLoading(true); setError(""); setTrack(null);
+    try {
+      const { track: t } = await fetchRandomFromPlaylist(playlistInfo.id, spotifyCreds.clientId, spotifyCreds.clientSecret);
+      setTrack(t);
+      setQText(`🎵 Welk jaar verscheen "${t.title}" van ${t.artist}?`);
+      if (t.year) buildYearOptions(parseInt(t.year));
+    } catch (e) { setError(e.message); }
+    setLoading(false);
+  };
   return (
     <div style={{ background: "#1A1A1A", border: "1px solid #2A2A2A", borderRadius: "16px", padding: "18px" }}>
       <div style={{ fontSize: "16px", fontWeight: 700, marginBottom: "14px" }}>🎵 Track via Spotify</div>
