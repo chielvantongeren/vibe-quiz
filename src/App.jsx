@@ -61,8 +61,48 @@ function Confetti() {
 }
 
 // ── STORAGE ───────────────────────────────────────────────────────────────
+const DEFAULT_VRAGEN = {
+  kennis: [
+    { id: 1, q: "Wat is de hoofdstad van Canada?", options: ["Toronto", "Vancouver", "Ottawa", "Montreal"], answer: 2, roundType: "kennis", track: null },
+    { id: 2, q: "Hoeveel landen telt de Europese Unie?", options: ["25", "27", "29", "31"], answer: 1, roundType: "kennis", track: null },
+    { id: 3, q: "Welk land heeft de meeste UNESCO werelderfgoederen?", options: ["China", "Italië", "Spanje", "Frankrijk"], answer: 1, roundType: "kennis", track: null },
+    { id: 4, q: "In welk jaar landde de mens voor het eerst op de maan?", options: ["1965", "1967", "1969", "1971"], answer: 2, roundType: "kennis", track: null },
+    { id: 5, q: "Wat is het snelste landdier ter wereld?", options: ["Leeuw", "Cheetah", "Pronghorn", "Gnoe"], answer: 1, roundType: "kennis", track: null },
+    { id: 6, q: "Hoeveel tanden heeft een volwassen mens normaal gesproken?", options: ["28", "30", "32", "34"], answer: 2, roundType: "kennis", track: null },
+    { id: 7, q: "Welke planeet is het grootst in ons zonnestelsel?", options: ["Saturnus", "Jupiter", "Neptunus", "Uranus"], answer: 1, roundType: "kennis", track: null },
+    { id: 8, q: "Wie schilderde de Nachtwacht?", options: ["Vermeer", "Rubens", "Rembrandt", "Hals"], answer: 2, roundType: "kennis", track: null },
+    { id: 9, q: "Wat is de langste rivier ter wereld?", options: ["Amazone", "Nijl", "Mississippi", "Yangtze"], answer: 1, roundType: "kennis", track: null },
+    { id: 10, q: "In welk jaar viel de Berlijnse Muur?", options: ["1987", "1988", "1989", "1990"], answer: 2, roundType: "kennis", track: null },
+  ],
+  blitz: [
+    { id: 11, q: "Hoeveel poten heeft een spin?", options: ["6", "8", "10", "12"], answer: 1, roundType: "blitz", track: null },
+    { id: 12, q: "Wat is 12 × 12?", options: ["132", "140", "144", "148"], answer: 2, roundType: "blitz", track: null },
+    { id: 13, q: "Welke kleur krijg je als je geel en blauw mengt?", options: ["Paars", "Oranje", "Groen", "Bruin"], answer: 2, roundType: "blitz", track: null },
+    { id: 14, q: "Hoeveel seconden heeft een minuut?", options: ["30", "60", "90", "100"], answer: 1, roundType: "blitz", track: null },
+    { id: 15, q: "Wat is de hoofdstad van België?", options: ["Antwerpen", "Gent", "Brussel", "Luik"], answer: 2, roundType: "blitz", track: null },
+    { id: 16, q: "Wat heeft een zebra meer van — zwarte of witte strepen?", options: ["Zwart", "Wit", "Gelijk", "Wisselend"], answer: 0, roundType: "blitz", track: null },
+    { id: 17, q: "Wat is het symbool van de Olympische Spelen 2024 Parijs?", options: ["Haan", "Marianne", "Eiffeltoren", "Leeuw"], answer: 1, roundType: "blitz", track: null },
+    { id: 18, q: "Hoe heet de vrouw van koning Willem-Alexander?", options: ["Beatrix", "Máxima", "Amalia", "Catharina"], answer: 1, roundType: "blitz", track: null },
+    { id: 19, q: "Wat is de snelheid van het licht (afgerond)?", options: ["200.000 km/s", "300.000 km/s", "400.000 km/s", "500.000 km/s"], answer: 1, roundType: "blitz", track: null },
+    { id: 20, q: "In welk land staat de Eiffeltoren?", options: ["Italië", "Spanje", "Frankrijk", "België"], answer: 2, roundType: "blitz", track: null },
+  ],
+  muziek: [],
+};
+
 const saveBank = (bank) => localStorage.setItem("vibe_vragenbank", JSON.stringify(bank));
-const loadBank = () => { const item = localStorage.getItem("vibe_vragenbank"); return item ? JSON.parse(item) : { kennis: [], blitz: [], muziek: [] }; };
+const loadBank = () => {
+  const item = localStorage.getItem("vibe_vragenbank");
+  if (item) {
+    const saved = JSON.parse(item);
+    // Merge defaults with saved — defaults first, then user additions
+    return {
+      kennis: [...DEFAULT_VRAGEN.kennis, ...saved.kennis.filter(q => q.id > 1000)],
+      blitz: [...DEFAULT_VRAGEN.blitz, ...saved.blitz.filter(q => q.id > 1000)],
+      muziek: saved.muziek || [],
+    };
+  }
+  return { ...DEFAULT_VRAGEN };
+};
 
 // ── SPOTIFY ───────────────────────────────────────────────────────────────
 const extractSpotifyId = (input) => { if (!input) return null; const m = input.match(/track\/([A-Za-z0-9]+)/); if (m) return m[1]; if (/^[A-Za-z0-9]{22}$/.test(input.trim())) return input.trim(); return null; };
