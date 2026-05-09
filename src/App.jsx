@@ -60,23 +60,12 @@ function Confetti() {
   return <canvas ref={canvasRef} style={{ position: "fixed", inset: 0, pointerEvents: "none", zIndex: 500 }} />;
 }
 
-// ── STORAGE: vragenbank via localStorage ──────────────────────────────────
-const saveBank = (bank) => {
-  localStorage.setItem("vibe_vragenbank", JSON.stringify(bank));
-};
-const loadBank = () => {
-  const item = localStorage.getItem("vibe_vragenbank");
-  return item ? JSON.parse(item) : { kennis: [], blitz: [], muziek: [] };
-};
+// ── STORAGE ───────────────────────────────────────────────────────────────
+const saveBank = (bank) => localStorage.setItem("vibe_vragenbank", JSON.stringify(bank));
+const loadBank = () => { const item = localStorage.getItem("vibe_vragenbank"); return item ? JSON.parse(item) : { kennis: [], blitz: [], muziek: [] }; };
 
 // ── SPOTIFY ───────────────────────────────────────────────────────────────
-const extractSpotifyId = (input) => {
-  if (!input) return null;
-  const m = input.match(/track\/([A-Za-z0-9]+)/);
-  if (m) return m[1];
-  if (/^[A-Za-z0-9]{22}$/.test(input.trim())) return input.trim();
-  return null;
-};
+const extractSpotifyId = (input) => { if (!input) return null; const m = input.match(/track\/([A-Za-z0-9]+)/); if (m) return m[1]; if (/^[A-Za-z0-9]{22}$/.test(input.trim())) return input.trim(); return null; };
 const fetchSpotifyTrack = async (trackId, clientId, clientSecret) => {
   const tokenRes = await fetch("https://accounts.spotify.com/api/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", "Authorization": "Basic " + btoa(clientId + ":" + clientSecret) }, body: "grant_type=client_credentials" });
   if (!tokenRes.ok) throw new Error("Token mislukt.");
@@ -93,10 +82,6 @@ const COLORS = [{ name: "Neon Rood", value: "#FF3B5C" }, { name: "Elektrisch Bla
 const ROUND_TIMES = { kennis: 20, blitz: 10, muziek: 30 };
 const ROUND_POINTS = { kennis: 100, blitz: 50, muziek: 200 };
 const ROUND_LABELS = { kennis: { icon: "🧠", label: "Kennis", color: "#3B8BFF" }, blitz: { icon: "⚡", label: "Blitz", color: "#FFD700" }, muziek: { icon: "🎵", label: "Muziek", color: "#BF5FFF" } };
-
-// ── GLOBAL STATE ──────────────────────────────────────────────────────────
-if (!window.__VIBE__) window.__VIBE__ = { teams: [], answers: {}, phase: "lobby", currentQ: null, gameOver: false };
-const G = () => window.__VIBE__;
 
 // ── STYLES ────────────────────────────────────────────────────────────────
 const S = {
@@ -116,122 +101,199 @@ const S = {
 export default function App() {
   const [screen, setScreen] = useState("home");
   const [gameCode, setGameCode] = useState("");
-  const [myTeamId, setMyTeamId] = useState(null);
-  const [tick, setTick] = useState(0);
-  const [spotifyCreds] = useState({
-    clientId: import.meta.env.VITE_SPOTIFY_CLIENT_ID || "",
-    clientSecret: import.meta.env.VITE_SPOTIFY_CLIENT_SECRET || "",
-  });
-  const [multiplayerMode, setMultiplayerMode] = useState(false);
+  const [myTeam, setMyTeam] = useState(null);
+  const [spotifyCreds] = useState({ clientId: import.meta.env.VITE_SPOTIFY_CLIENT_ID || "", clientSecret: import.meta.env.VITE_SPOTIFY_CLIENT_SECRET || "" });
   const [syncStatus, setSyncStatus] = useState("idle");
   const [vragenbank, setVragenbank] = useState(() => loadBank());
+
+  // Game state
+  const [teams, setTeams] = useState([]);
+  const [gamePhase, setGamePhase] = useState("lobby");
+  const [currentQ, setCurrentQ] = useState(null);
+  const [answers, setAnswers] = useState({});
+  const [gameOver, setGameOver] = useState(false);
+
   const channelRef = useRef(null);
-  const refresh = useCallback(() => setTick(t => t + 1), []);
+  const isHostRef = useRef(false);
+  const pendingTeamRef = useRef(null); // team waiting to be sent after subscribe
 
   const saveAndSetBank = (newBank) => { setVragenbank(newBank); saveBank(newBank); };
 
-  // ── SUPABASE REALTIME ──
+  // ── Check URL hash for QR join ──
   useEffect(() => {
-    if (!multiplayerMode || !gameCode) return;
-    const isHost = screen === "host" || screen === "bigscreen";
+    const hash = window.location.hash.replace("#", "");
+    if (hash.startsWith("join-")) {
+      const code = hash.replace("join-", "").toUpperCase();
+      setGameCode(code);
+      setScreen("join");
+      window.location.hash = "";
+    }
+  }, []);
 
-    const channel = supabase.channel(`vibe-${gameCode}`, {
+  // ── Setup Supabase channel ──
+  const setupChannel = useCallback((code, isHost) => {
+    // Cleanup old channel
+    if (channelRef.current) {
+      channelRef.current.unsubscribe();
+      channelRef.current = null;
+    }
+    isHostRef.current = isHost;
+
+    const channel = supabase.channel(`vibe-${code}`, {
       config: { broadcast: { self: false } }
     });
 
-    // Spelers ontvangen spelstatus van host
-    if (!isHost) {
-      channel.on("broadcast", { event: "gamestate" }, ({ payload }) => {
-        Object.assign(G(), {
-          teams: payload.teams || [],
-          phase: payload.phase || "lobby",
-          currentQ: payload.currentQ || null,
-          answers: payload.answers || {},
-          gameOver: payload.gameOver || false,
+    if (isHost) {
+      // Host: listen for joining teams and answers
+      channel.on("broadcast", { event: "join_team" }, ({ payload }) => {
+        console.log("Host received join_team:", payload.team);
+        setTeams(prev => {
+          if (prev.find(t => t.id === payload.team.id)) return prev;
+          const updated = [...prev, payload.team];
+          // Broadcast updated state back to all players
+          setTimeout(() => {
+            if (channelRef.current) {
+              channelRef.current.send({
+                type: "broadcast", event: "gamestate",
+                payload: { teams: updated, phase: "lobby", currentQ: null, answers: {}, gameOver: false }
+              });
+            }
+          }, 100);
+          return updated;
         });
         setSyncStatus("ok");
-        refresh();
       });
-    }
 
-    // Host ontvangt antwoorden van spelers
-    if (isHost) {
       channel.on("broadcast", { event: "answer" }, ({ payload }) => {
-        G().answers[payload.teamId] = payload.answerIdx;
+        setAnswers(prev => ({ ...prev, [payload.teamId]: payload.answerIdx }));
         setSyncStatus("ok");
-        refresh();
+      });
+
+    } else {
+      // Player: listen for game state from host
+      channel.on("broadcast", { event: "gamestate" }, ({ payload }) => {
+        setTeams(payload.teams || []);
+        setGamePhase(payload.phase || "lobby");
+        setCurrentQ(payload.currentQ || null);
+        setAnswers(payload.answers || {});
+        setGameOver(payload.gameOver || false);
+        setSyncStatus("ok");
       });
     }
 
     channel.subscribe((status) => {
-      setSyncStatus(status === "SUBSCRIBED" ? "ok" : "error");
+      console.log("Channel status:", status);
+      if (status === "SUBSCRIBED") {
+        setSyncStatus("ok");
+        // If player has a pending team to send, send it now
+        if (!isHost && pendingTeamRef.current) {
+          console.log("Sending pending team:", pendingTeamRef.current);
+          channel.send({
+            type: "broadcast", event: "join_team",
+            payload: { team: pendingTeamRef.current }
+          });
+          pendingTeamRef.current = null;
+        }
+      } else if (status === "CHANNEL_ERROR") {
+        setSyncStatus("error");
+      }
     });
 
     channelRef.current = channel;
-    return () => { channel.unsubscribe(); channelRef.current = null; };
-  }, [multiplayerMode, gameCode, screen]);
+    return channel;
+  }, []);
 
-  // Host broadcast spelstatus naar alle spelers
-  const broadcastState = useCallback(() => {
-    if (!channelRef.current || !multiplayerMode) return;
+  // ── Broadcast state (host only) ──
+  const broadcastState = useCallback((overrides = {}) => {
+    if (!channelRef.current || !isHostRef.current) return;
     channelRef.current.send({
       type: "broadcast", event: "gamestate",
-      payload: { teams: G().teams, phase: G().phase, currentQ: G().currentQ, answers: G().answers, gameOver: G().gameOver }
+      payload: {
+        teams: overrides.teams ?? teams,
+        phase: overrides.phase ?? gamePhase,
+        currentQ: overrides.currentQ ?? currentQ,
+        answers: overrides.answers ?? answers,
+        gameOver: overrides.gameOver ?? gameOver,
+      }
     });
-  }, [multiplayerMode]);
-
-  // Speler stuurt antwoord naar host
-  const submitAnswer = useCallback((teamId, answerIdx) => {
-    G().answers[teamId] = answerIdx;
-    refresh();
-    if (multiplayerMode && channelRef.current) {
-      channelRef.current.send({ type: "broadcast", event: "answer", payload: { teamId, answerIdx } });
-    }
-  }, [multiplayerMode, refresh]);
+  }, [teams, gamePhase, currentQ, answers, gameOver]);
 
   const startHost = () => {
     const code = Math.random().toString(36).substring(2, 7).toUpperCase();
     setGameCode(code);
-    Object.assign(G(), { teams: [], phase: "lobby", currentQ: null, answers: {}, gameOver: false });
+    setTeams([]); setGamePhase("lobby"); setCurrentQ(null); setAnswers({}); setGameOver(false);
+    setupChannel(code, true);
     setScreen("host");
   };
 
-  const addTeam = useCallback((name, color, emoji) => {
-    const t = { id: Date.now(), name, color, emoji, score: 0 };
-    G().teams = [...G().teams, t];
-    refresh();
-    broadcastState();
-    return t;
-  }, [refresh, broadcastState]);
+  const handleJoinCode = (code) => {
+    setGameCode(code);
+    setupChannel(code, false);
+  };
+
+  const handleJoined = (team) => {
+    setMyTeam(team);
+    // Store team as pending — will be sent once channel is subscribed
+    if (channelRef.current) {
+      // Check if already subscribed
+      pendingTeamRef.current = team;
+      // Try sending immediately too (in case already subscribed)
+      try {
+        channelRef.current.send({
+          type: "broadcast", event: "join_team",
+          payload: { team }
+        });
+        pendingTeamRef.current = null;
+      } catch (e) {
+        console.log("Will send on subscribe:", e);
+      }
+    }
+    setScreen("player");
+  };
 
   const awardPoints = useCallback((tid, pts) => {
-    G().teams = G().teams.map(t => t.id === tid ? { ...t, score: t.score + pts } : t);
-    refresh();
-    broadcastState();
-  }, [refresh, broadcastState]);
+    setTeams(prev => {
+      const updated = prev.map(t => t.id === tid ? { ...t, score: t.score + pts } : t);
+      if (channelRef.current && isHostRef.current) {
+        channelRef.current.send({
+          type: "broadcast", event: "gamestate",
+          payload: { teams: updated, phase: gamePhase, currentQ, answers, gameOver }
+        });
+      }
+      return updated;
+    });
+  }, [gamePhase, currentQ, answers, gameOver]);
 
   const endGame = useCallback(() => {
-    G().gameOver = true; G().phase = "gameover";
-    refresh(); broadcastState();
-  }, [refresh, broadcastState]);
+    setGameOver(true); setGamePhase("gameover");
+    broadcastState({ gameOver: true, phase: "gameover" });
+  }, [broadcastState]);
 
-  const g = G();
-  if ((screen === "host" || screen === "bigscreen" || screen === "player") && (g.gameOver || g.phase === "gameover")) {
-    return <EndScreen teams={g.teams} onRestart={() => { G().gameOver = false; G().phase = "lobby"; G().teams = []; refresh(); setScreen("home"); }} />;
+  const submitAnswer = useCallback((teamId, answerIdx) => {
+    if (channelRef.current) {
+      channelRef.current.send({ type: "broadcast", event: "answer", payload: { teamId, answerIdx } });
+    }
+    setAnswers(prev => ({ ...prev, [teamId]: answerIdx }));
+  }, []);
+
+  const g = { teams, phase: gamePhase, currentQ, answers, gameOver };
+
+  if ((screen === "host" || screen === "bigscreen" || screen === "player") && (gameOver || gamePhase === "gameover")) {
+    return <EndScreen teams={teams} onRestart={() => { setTeams([]); setGamePhase("lobby"); setGameOver(false); setCurrentQ(null); setAnswers({}); setScreen("home"); }} />;
   }
 
-  const commonProps = { code: gameCode, refresh, tick, addTeam, awardPoints, openBig: () => setScreen("bigscreen"), spotifyCreds, onEndGame: endGame, multiplayerMode, syncStatus, broadcastState, vragenbank, saveAndSetBank };
+  const hostProps = { code: gameCode, g, setTeams, setGamePhase, setCurrentQ, setAnswers, broadcastState, awardPoints, openBig: () => setScreen("bigscreen"), spotifyCreds, onEndGame: endGame, syncStatus, vragenbank, saveAndSetBank };
 
-  if (screen === "home") return <Home onHost={startHost} onJoin={() => setScreen("join")} multiplayerMode={multiplayerMode} setMultiplayerMode={setMultiplayerMode} onBank={() => setScreen("bank")} />;
+  if (screen === "home") return <Home onHost={startHost} onJoin={() => setScreen("join")} onBank={() => setScreen("bank")} />;
   if (screen === "bank") return <VragenBankScreen vragenbank={vragenbank} saveAndSetBank={saveAndSetBank} spotifyCreds={spotifyCreds} onBack={() => setScreen("home")} />;
-  if (screen === "host") return <HostView {...commonProps} />;
-  if (screen === "join") return <JoinView onJoined={t => { addTeam(t.name, t.color, t.emoji); setMyTeamId(t.id); setScreen("player"); }} onBack={() => setScreen("home")} gameCode={gameCode} setGameCode={setGameCode} multiplayerMode={multiplayerMode} setMultiplayerMode={setMultiplayerMode} />;
-  if (screen === "player") return <PlayerView myTeamId={myTeamId} tick={tick} submitAnswer={submitAnswer} />;
-  if (screen === "bigscreen") return <BigScreen {...commonProps} onBack={() => setScreen("host")} />;
+  if (screen === "host") return <HostView {...hostProps} />;
+  if (screen === "join") return <JoinView prefilledCode={gameCode} onJoinCode={handleJoinCode} onJoined={handleJoined} onBack={() => setScreen("home")} />;
+  if (screen === "player") return <PlayerView myTeam={myTeam} g={g} submitAnswer={submitAnswer} />;
+  if (screen === "bigscreen") return <BigScreen {...hostProps} onBack={() => setScreen("host")} />;
 }
 
 // ── HOME ──────────────────────────────────────────────────────────────────
-function Home({ onHost, onJoin, multiplayerMode, setMultiplayerMode, onBank }) {
+function Home({ onHost, onJoin, onBank }) {
   return (
     <div style={S.app}><div style={S.grain} />
       <div style={S.center}>
@@ -240,15 +302,7 @@ function Home({ onHost, onJoin, multiplayerMode, setMultiplayerMode, onBank }) {
         <div style={{ ...S.card, textAlign: "center" }}>
           <button style={{ ...S.btn("primary", "lg"), width: "100%", marginBottom: "10px" }} onClick={onHost}>🎮 Spel starten als host</button>
           <button style={{ ...S.btn("secondary", "lg"), width: "100%", marginBottom: "10px" }} onClick={onJoin}>📱 Joinen als speler</button>
-          <button style={{ ...S.btn("ghost", "lg"), width: "100%", marginBottom: "16px" }} onClick={onBank}>🗂 Vragenbank beheren</button>
-          <div style={{ borderTop: "1px solid #2A2A2A", paddingTop: "14px" }}>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "10px" }}>
-              <div onClick={() => setMultiplayerMode(!multiplayerMode)} style={{ width: "44px", height: "24px", borderRadius: "12px", background: multiplayerMode ? "#FFD700" : "#333", cursor: "pointer", position: "relative", transition: "background 0.2s" }}>
-                <div style={{ position: "absolute", top: "3px", left: multiplayerMode ? "23px" : "3px", width: "18px", height: "18px", borderRadius: "50%", background: multiplayerMode ? "#0D0D0D" : "#888", transition: "left 0.2s" }} />
-              </div>
-              <span style={{ fontSize: "12px", color: multiplayerMode ? "#FFD700" : "#555" }}>🌐 Multiplayer {multiplayerMode ? "aan" : "uit"}</span>
-            </div>
-          </div>
+          <button style={{ ...S.btn("ghost", "lg"), width: "100%" }} onClick={onBank}>🗂 Vragenbank beheren</button>
         </div>
       </div>
     </div>
@@ -292,7 +346,7 @@ function EndScreen({ teams, onRestart }) {
 }
 
 // ── HOST VIEW ─────────────────────────────────────────────────────────────
-function HostView({ code, refresh, tick, addTeam, awardPoints, openBig, spotifyCreds, onEndGame, multiplayerMode, syncStatus, broadcastState, vragenbank, saveAndSetBank }) {
+function HostView({ code, g, setTeams, setGamePhase, setCurrentQ, setAnswers, broadcastState, awardPoints, openBig, spotifyCreds, onEndGame, syncStatus, vragenbank, saveAndSetBank }) {
   const [tab, setTab] = useState("lobby");
   const tabs = [{ k: "lobby", label: "👥" }, { k: "control", label: "🎛" }, { k: "bank", label: "🗂" }, { k: "instellingen", label: "⚙️" }];
   return (
@@ -300,14 +354,16 @@ function HostView({ code, refresh, tick, addTeam, awardPoints, openBig, spotifyC
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 16px 0", marginBottom: "14px" }}>
         <div style={S.logoSm}>VIBE</div>
         <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
-          {multiplayerMode && <div style={{ ...S.tag(syncStatus === "ok" ? "#39FF14" : syncStatus === "error" ? "#FF3B5C" : "#FFD700"), fontSize: "10px" }}>{syncStatus === "ok" ? "● SYNC" : syncStatus === "error" ? "● ERR" : "● ..."}</div>}
-          <button style={{ ...S.btn("secondary", "sm") }} onClick={onEndGame}>🏁</button>
-          <button style={{ ...S.btn("primary", "sm") }} onClick={openBig}>📺</button>
+          <div style={{ ...S.tag(syncStatus === "ok" ? "#39FF14" : syncStatus === "error" ? "#FF3B5C" : "#FFD700"), fontSize: "10px" }}>
+            {syncStatus === "ok" ? "● LIVE" : syncStatus === "error" ? "● ERR" : "● ..."}
+          </div>
+          <button style={S.btn("secondary", "sm")} onClick={onEndGame}>🏁</button>
+          <button style={S.btn("primary", "sm")} onClick={openBig}>📺</button>
         </div>
       </div>
       <div style={{ padding: "0 16px" }}>
-        {tab === "lobby" && <HostLobbyTab code={code} addTeam={addTeam} tick={tick} multiplayerMode={multiplayerMode} />}
-        {tab === "control" && <HostControlTab awardPoints={awardPoints} refresh={refresh} tick={tick} vragenbank={vragenbank} broadcastState={broadcastState} />}
+        {tab === "lobby" && <HostLobbyTab code={code} g={g} setTeams={setTeams} broadcastState={broadcastState} />}
+        {tab === "control" && <HostControlTab g={g} setGamePhase={setGamePhase} setCurrentQ={setCurrentQ} setAnswers={setAnswers} broadcastState={broadcastState} awardPoints={awardPoints} vragenbank={vragenbank} />}
         {tab === "bank" && <InGameBankTab vragenbank={vragenbank} saveAndSetBank={saveAndSetBank} spotifyCreds={spotifyCreds} />}
         {tab === "instellingen" && <SpotifyCredsTab />}
       </div>
@@ -325,13 +381,24 @@ function HostView({ code, refresh, tick, addTeam, awardPoints, openBig, spotifyC
 }
 
 // ── LOBBY TAB ─────────────────────────────────────────────────────────────
-function HostLobbyTab({ code, addTeam, tick, multiplayerMode }) {
+function HostLobbyTab({ code, g, setTeams, broadcastState }) {
   const [dName, setDName] = useState("");
   const [dColor, setDColor] = useState(COLORS[0]);
   const [dEmoji, setDEmoji] = useState(EMOJIS[0]);
   const [showQR, setShowQR] = useState(true);
-  const teams = G().teams;
   const joinUrl = `${window.location.origin}/#join-${code}`;
+
+  const addTestTeam = () => {
+    if (!dName.trim()) return;
+    const t = { id: Date.now(), name: dName.trim(), color: dColor.value, emoji: dEmoji, score: 0 };
+    setTeams(prev => {
+      const updated = [...prev, t];
+      broadcastState({ teams: updated });
+      return updated;
+    });
+    setDName("");
+  };
+
   return (
     <div>
       <div style={{ background: "#1A1A1A", border: "1px solid #2A2A2A", borderRadius: "16px", padding: "16px", marginBottom: "12px" }}>
@@ -344,70 +411,89 @@ function HostLobbyTab({ code, addTeam, tick, multiplayerMode }) {
         </div>
         {showQR ? (
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "10px" }}>
-            <div style={{ padding: "12px", background: "#1A1A1A", borderRadius: "14px", border: "2px solid #FFD70044" }}><QRCodeSVG value={joinUrl} size={170} /></div>
+            <div style={{ padding: "12px", background: "#1A1A1A", borderRadius: "14px", border: "2px solid #FFD70044" }}>
+              <QRCodeSVG value={joinUrl} size={170} />
+            </div>
             <div style={{ fontSize: "28px", fontWeight: 900, letterSpacing: "0.3em", background: "linear-gradient(135deg,#FFD700,#FF6B00)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>{code}</div>
           </div>
         ) : (
-          <div style={{ textAlign: "center" }}><div style={{ fontSize: "56px", fontWeight: 900, letterSpacing: "0.35em", background: "linear-gradient(135deg,#FFD700,#FF6B00)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>{code}</div></div>
+          <div style={{ textAlign: "center" }}>
+            <div style={{ fontSize: "56px", fontWeight: 900, letterSpacing: "0.35em", background: "linear-gradient(135deg,#FFD700,#FF6B00)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>{code}</div>
+          </div>
         )}
       </div>
+
       <div style={{ background: "#1A1A1A", border: "1px solid #2A2A2A", borderRadius: "16px", padding: "16px", marginBottom: "12px" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
-          <div style={S.label}>Teams ({teams.length})</div>
-          {teams.length > 0 && <div style={S.tag("#39FF14")}>LIVE</div>}
+          <div style={S.label}>Teams ({g.teams.length})</div>
+          {g.teams.length > 0 && <div style={S.tag("#39FF14")}>LIVE</div>}
         </div>
-        {teams.length === 0 ? <div style={{ textAlign: "center", padding: "16px", color: "#333", fontSize: "13px" }}>📱 Scan de QR code om mee te doen</div>
-          : <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>{teams.map(t => <TeamChip key={t.id} team={t} />)}</div>}
+        {g.teams.length === 0
+          ? <div style={{ textAlign: "center", padding: "16px", color: "#333", fontSize: "13px" }}>📱 Scan de QR code om mee te doen</div>
+          : <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>{g.teams.map(t => <TeamChip key={t.id} team={t} />)}</div>}
       </div>
+
       <div style={{ background: "#1A1A1A", border: "1px solid #2A2A2A", borderRadius: "16px", padding: "16px" }}>
         <div style={{ ...S.label, marginBottom: "10px" }}>Testteam toevoegen</div>
         <input style={{ ...S.input, marginBottom: "8px" }} placeholder="Teamnaam" value={dName} onChange={e => setDName(e.target.value)} />
-        <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginBottom: "8px" }}>{COLORS.map(c => <div key={c.value} onClick={() => setDColor(c)} style={{ width: "22px", height: "22px", borderRadius: "50%", background: c.value, cursor: "pointer", border: dColor.value === c.value ? "3px solid #fff" : "3px solid transparent" }} />)}</div>
-        <div style={{ display: "flex", gap: "4px", flexWrap: "wrap", marginBottom: "10px" }}>{EMOJIS.slice(0, 16).map(em => <div key={em} onClick={() => setDEmoji(em)} style={{ padding: "4px", borderRadius: "6px", cursor: "pointer", fontSize: "18px", background: dEmoji === em ? "#2A2A2A" : "transparent" }}>{em}</div>)}</div>
-        <button style={{ ...S.btn("primary", "sm"), width: "100%" }} onClick={() => { if (dName.trim()) { addTeam(dName.trim(), dColor.value, dEmoji); setDName(""); } }}>+ Toevoegen</button>
+        <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginBottom: "8px" }}>
+          {COLORS.map(c => <div key={c.value} onClick={() => setDColor(c)} style={{ width: "22px", height: "22px", borderRadius: "50%", background: c.value, cursor: "pointer", border: dColor.value === c.value ? "3px solid #fff" : "3px solid transparent" }} />)}
+        </div>
+        <div style={{ display: "flex", gap: "4px", flexWrap: "wrap", marginBottom: "10px" }}>
+          {EMOJIS.slice(0, 16).map(em => <div key={em} onClick={() => setDEmoji(em)} style={{ padding: "4px", borderRadius: "6px", cursor: "pointer", fontSize: "18px", background: dEmoji === em ? "#2A2A2A" : "transparent" }}>{em}</div>)}
+        </div>
+        <button style={{ ...S.btn("primary", "sm"), width: "100%" }} onClick={addTestTeam}>+ Toevoegen</button>
       </div>
     </div>
   );
 }
 
 // ── CONTROL TAB ───────────────────────────────────────────────────────────
-function HostControlTab({ awardPoints, refresh, tick, vragenbank, broadcastState }) {
+function HostControlTab({ g, setGamePhase, setCurrentQ, setAnswers, broadcastState, awardPoints, vragenbank }) {
   const [roundType, setRoundType] = useState("kennis");
   const [qIdx, setQIdx] = useState(0);
   const [phase, setPhase] = useState("idle");
   const [timer, setTimer] = useState(0);
-  const [answers, setAnswers] = useState({});
   const [playing, setPlaying] = useState(false);
   const intervalRef = useRef(null);
   const audioRef = useRef(null);
   const questions = vragenbank[roundType] || [];
   const currentQ = questions[qIdx];
   const labels = ["A", "B", "C", "D"];
+  const rl = ROUND_LABELS;
 
   const startQ = () => {
     if (!currentQ) return;
     const t = ROUND_TIMES[roundType];
-    setTimer(t); setAnswers({}); setPhase("question");
-    G().phase = "question"; G().currentQ = { ...currentQ, roundType, qIdx, timeLeft: t }; G().answers = {};
-    broadcastState();
-    if (roundType === "muziek" && currentQ.track?.previewUrl && audioRef.current) { audioRef.current.src = currentQ.track.previewUrl; audioRef.current.play().then(() => setPlaying(true)).catch(() => {}); }
+    setTimer(t); setPhase("question");
+    const q = { ...currentQ, roundType, qIdx, timeLeft: t };
+    setCurrentQ(q); setAnswers({}); setGamePhase("question");
+    broadcastState({ phase: "question", currentQ: q, answers: {} });
+    if (roundType === "muziek" && currentQ.track?.previewUrl && audioRef.current) {
+      audioRef.current.src = currentQ.track.previewUrl;
+      audioRef.current.play().then(() => setPlaying(true)).catch(() => { });
+    }
     clearInterval(intervalRef.current);
     intervalRef.current = setInterval(() => {
-      setTimer(p => { const n = p - 1; if (G().currentQ) G().currentQ.timeLeft = n; if (n <= 0) { clearInterval(intervalRef.current); doReveal(); } return n; });
+      setTimer(p => {
+        const n = p - 1;
+        setCurrentQ(prev => prev ? { ...prev, timeLeft: n } : prev);
+        if (n <= 0) { clearInterval(intervalRef.current); doReveal(); }
+        return n;
+      });
     }, 1000);
   };
 
   const doReveal = () => {
     clearInterval(intervalRef.current);
-    setPhase("reveal"); G().phase = "reveal";
+    setPhase("reveal"); setGamePhase("reveal");
     if (audioRef.current) { audioRef.current.pause(); audioRef.current.currentTime = 0; setPlaying(false); }
-    setAnswers({ ...G().answers });
-    broadcastState();
+    broadcastState({ phase: "reveal" });
   };
 
   const givePoints = () => {
     const pts = ROUND_POINTS[roundType];
-    Object.entries(G().answers).forEach(([tid, ans]) => { if (parseInt(ans) === currentQ.answer) awardPoints(parseInt(tid), pts); });
+    Object.entries(g.answers).forEach(([tid, ans]) => { if (parseInt(ans) === currentQ.answer) awardPoints(parseInt(tid), pts); });
     nextQ();
   };
 
@@ -415,15 +501,11 @@ function HostControlTab({ awardPoints, refresh, tick, vragenbank, broadcastState
     clearInterval(intervalRef.current);
     if (audioRef.current) { audioRef.current.pause(); audioRef.current.currentTime = 0; setPlaying(false); }
     setQIdx((qIdx + 1) % Math.max(questions.length, 1));
-    setPhase("idle"); G().phase = "lobby"; G().currentQ = null; G().answers = {}; setAnswers({});
-    broadcastState();
+    setPhase("idle"); setGamePhase("lobby"); setCurrentQ(null); setAnswers({});
+    broadcastState({ phase: "lobby", currentQ: null, answers: {} });
   };
 
   useEffect(() => () => clearInterval(intervalRef.current), []);
-  useEffect(() => { if (phase === "question") setAnswers({ ...G().answers }); }, [tick]);
-
-  const teams = G().teams;
-  const rl = ROUND_LABELS;
 
   return (
     <div>
@@ -438,8 +520,11 @@ function HostControlTab({ awardPoints, refresh, tick, vragenbank, broadcastState
           ))}
         </div>
       </div>
+
       {questions.length === 0
-        ? <div style={{ background: "#1A1A1A", border: "1px solid #2A2A2A", borderRadius: "16px", padding: "20px", textAlign: "center", color: "#555", fontSize: "13px" }}>Geen vragen in {rl[roundType].label}bank.<br /><span style={{ color: "#444" }}>Voeg ze toe via 🗂 Bank.</span></div>
+        ? <div style={{ background: "#1A1A1A", border: "1px solid #2A2A2A", borderRadius: "16px", padding: "20px", textAlign: "center", color: "#555", fontSize: "13px" }}>
+          Geen vragen in {rl[roundType].label}bank.<br /><span style={{ color: "#444" }}>Voeg ze toe via 🗂 Bank.</span>
+        </div>
         : <div style={{ background: "#1A1A1A", border: "1px solid #2A2A2A", borderRadius: "16px", padding: "16px", marginBottom: "12px" }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
             <div style={{ ...S.label, marginBottom: 0 }}>Vraag {qIdx + 1}/{questions.length}</div>
@@ -464,18 +549,22 @@ function HostControlTab({ awardPoints, refresh, tick, vragenbank, broadcastState
           </div>}
         </div>
       }
+
       <div style={{ background: "#1A1A1A", border: "1px solid #2A2A2A", borderRadius: "16px", padding: "14px" }}>
-        <div style={{ ...S.label, marginBottom: "8px" }}>Antwoorden {Object.keys(answers).length}/{teams.length}</div>
-        {teams.length === 0 ? <div style={{ color: "#333", fontSize: "12px" }}>Geen teams.</div>
+        <div style={{ ...S.label, marginBottom: "8px" }}>Antwoorden {Object.keys(g.answers).length}/{g.teams.length}</div>
+        {g.teams.length === 0 ? <div style={{ color: "#333", fontSize: "12px" }}>Geen teams.</div>
           : <div style={{ display: "flex", flexDirection: "column", gap: "5px" }}>
-            {teams.map(t => { const ans = answers[t.id]; const correct = phase === "reveal" && parseInt(ans) === currentQ?.answer; const wrong = phase === "reveal" && ans !== undefined && !correct; return (
-              <div key={t.id} style={{ display: "flex", alignItems: "center", gap: "8px", padding: "7px 12px", borderRadius: "8px", background: "#111", border: `1px solid ${correct ? "#39FF1444" : wrong ? "#FF3B5C33" : "#1A1A1A"}` }}>
-                <span style={{ fontSize: "15px" }}>{t.emoji}</span>
-                <span style={{ flex: 1, fontWeight: 700, color: t.color, fontSize: "12px" }}>{t.name}</span>
-                {ans !== undefined ? <span style={{ fontSize: "11px", background: correct ? "#39FF1422" : wrong ? "#FF3B5C22" : "#2A2A2A", color: correct ? "#39FF14" : wrong ? "#FF3B5C" : "#888", padding: "2px 7px", borderRadius: "5px", fontWeight: 700 }}>{labels[ans]} {correct ? "✓" : wrong ? "✗" : ""}</span> : <span style={{ color: "#333", fontSize: "11px" }}>⏳</span>}
-                <span style={{ fontSize: "10px", color: "#444" }}>{t.score}p</span>
-              </div>
-            ); })}
+            {g.teams.map(t => {
+              const ans = g.answers[t.id]; const correct = phase === "reveal" && parseInt(ans) === currentQ?.answer; const wrong = phase === "reveal" && ans !== undefined && !correct;
+              return (
+                <div key={t.id} style={{ display: "flex", alignItems: "center", gap: "8px", padding: "7px 12px", borderRadius: "8px", background: "#111", border: `1px solid ${correct ? "#39FF1444" : wrong ? "#FF3B5C33" : "#1A1A1A"}` }}>
+                  <span style={{ fontSize: "15px" }}>{t.emoji}</span>
+                  <span style={{ flex: 1, fontWeight: 700, color: t.color, fontSize: "12px" }}>{t.name}</span>
+                  {ans !== undefined ? <span style={{ fontSize: "11px", background: correct ? "#39FF1422" : wrong ? "#FF3B5C22" : "#2A2A2A", color: correct ? "#39FF14" : wrong ? "#FF3B5C" : "#888", padding: "2px 7px", borderRadius: "5px", fontWeight: 700 }}>{labels[ans]} {correct ? "✓" : wrong ? "✗" : ""}</span> : <span style={{ color: "#333", fontSize: "11px" }}>⏳</span>}
+                  <span style={{ fontSize: "10px", color: "#444" }}>{t.score}p</span>
+                </div>
+              );
+            })}
           </div>
         }
       </div>
@@ -483,252 +572,31 @@ function HostControlTab({ awardPoints, refresh, tick, vragenbank, broadcastState
   );
 }
 
-// ── VRAGENBANK SCREEN ─────────────────────────────────────────────────────
-function VragenBankScreen({ vragenbank, saveAndSetBank, spotifyCreds, onBack }) {
-  const [activeTab, setActiveTab] = useState("kennis");
-  const [editQ, setEditQ] = useState(null);
-  const [showSpotify, setShowSpotify] = useState(false);
-  const rl = ROUND_LABELS;
-
-  const addQuestion = (q) => { saveAndSetBank({ ...vragenbank, [activeTab]: [...vragenbank[activeTab], { ...q, id: Date.now() }] }); setEditQ(null); setShowSpotify(false); };
-  const updateQuestion = (idx, q) => { const arr = [...vragenbank[activeTab]]; arr[idx] = { ...q, id: arr[idx].id }; saveAndSetBank({ ...vragenbank, [activeTab]: arr }); setEditQ(null); };
-  const deleteQuestion = (idx) => { saveAndSetBank({ ...vragenbank, [activeTab]: vragenbank[activeTab].filter((_, i) => i !== idx) }); };
-  const moveQuestion = (idx, dir) => { const arr = [...vragenbank[activeTab]]; const to = idx + dir; if (to < 0 || to >= arr.length) return; [arr[idx], arr[to]] = [arr[to], arr[idx]]; saveAndSetBank({ ...vragenbank, [activeTab]: arr }); };
-
-  return (
-    <div style={{ ...S.app, paddingBottom: "20px" }}><div style={S.grain} />
-      <div style={{ padding: "16px" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "16px" }}>
-          <button style={S.btn("ghost", "sm")} onClick={onBack}>←</button>
-          <div style={S.logoSm}>Vragenbank</div>
-          <div style={{ marginLeft: "auto", fontSize: "12px", color: "#555" }}>{Object.values(vragenbank).flat().length} vragen</div>
-        </div>
-        <div style={{ display: "flex", gap: "6px", marginBottom: "16px" }}>
-          {["kennis", "blitz", "muziek"].map(t => (
-            <button key={t} onClick={() => { setActiveTab(t); setEditQ(null); setShowSpotify(false); }} style={{ ...S.btn(activeTab === t ? "primary" : "secondary", "sm"), flex: 1, flexDirection: "column", gap: "2px", padding: "10px 4px" }}>
-              <span style={{ fontSize: "18px" }}>{rl[t].icon}</span>
-              <span style={{ fontSize: "10px" }}>{rl[t].label} ({vragenbank[t].length})</span>
-            </button>
-          ))}
-        </div>
-        {editQ === null && !showSpotify && (<>
-          <div style={{ display: "flex", gap: "8px", marginBottom: "12px" }}>
-            <button style={{ ...S.btn("primary", "sm"), flex: 1 }} onClick={() => setEditQ("new")}>+ Nieuwe vraag</button>
-            {activeTab === "muziek" && <button style={{ ...S.btn("secondary", "sm"), flex: 1 }} onClick={() => setShowSpotify(true)}>🎵 Via Spotify</button>}
-          </div>
-          {vragenbank[activeTab].length === 0
-            ? <div style={{ textAlign: "center", padding: "40px 20px", color: "#333" }}><div style={{ fontSize: "40px", marginBottom: "12px" }}>{rl[activeTab].icon}</div><div style={{ fontSize: "14px" }}>Nog geen vragen — voeg er een toe!</div></div>
-            : <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-              {vragenbank[activeTab].map((q, i) => (<QuestionCard key={q.id || i} q={q} i={i} total={vragenbank[activeTab].length} onEdit={() => setEditQ({ ...q, index: i })} onDelete={() => deleteQuestion(i)} onMove={dir => moveQuestion(i, dir)} />))}
-            </div>}
-        </>)}
-        {(editQ === "new" || (editQ && editQ.index !== undefined)) && <QuestionForm initial={editQ === "new" ? null : editQ} type={activeTab} onSave={q => editQ === "new" ? addQuestion(q) : updateQuestion(editQ.index, q)} onCancel={() => setEditQ(null)} />}
-        {showSpotify && activeTab === "muziek" && <SpotifyAdder spotifyCreds={spotifyCreds} onAdd={q => { addQuestion(q); setShowSpotify(false); }} onCancel={() => setShowSpotify(false)} />}
-      </div>
-    </div>
-  );
-}
-
-// ── QUESTION CARD ─────────────────────────────────────────────────────────
-function QuestionCard({ q, i, total, onEdit, onDelete, onMove }) {
-  const [open, setOpen] = useState(false);
-  const labels = ["A", "B", "C", "D"];
-  return (
-    <div style={{ background: "#1A1A1A", border: "1px solid #2A2A2A", borderRadius: "12px", overflow: "hidden" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: "10px", padding: "12px 14px", cursor: "pointer" }} onClick={() => setOpen(!open)}>
-        <div style={{ width: "22px", height: "22px", borderRadius: "50%", background: "#2A2A2A", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "11px", color: "#666", flexShrink: 0, fontWeight: 700 }}>{i + 1}</div>
-        {q.track?.cover && <img src={q.track.cover} alt="" style={{ width: "36px", height: "36px", borderRadius: "5px", objectFit: "cover", flexShrink: 0 }} />}
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: "13px", fontWeight: 600, lineHeight: 1.4, whiteSpace: open ? "normal" : "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{q.q}</div>
-          {q.track && <div style={{ fontSize: "11px", color: "#555", marginTop: "2px" }}>{q.track.artist} · {q.track.year}</div>}
-        </div>
-        <div style={{ display: "flex", gap: "4px", alignItems: "center", flexShrink: 0 }}>
-          <button style={{ ...S.btn("ghost", "sm"), padding: "4px 6px", opacity: i === 0 ? 0.3 : 1 }} onClick={e => { e.stopPropagation(); onMove(-1); }}>↑</button>
-          <button style={{ ...S.btn("ghost", "sm"), padding: "4px 6px", opacity: i === total - 1 ? 0.3 : 1 }} onClick={e => { e.stopPropagation(); onMove(1); }}>↓</button>
-          <span style={{ fontSize: "14px", color: "#444" }}>{open ? "▲" : "▼"}</span>
-        </div>
-      </div>
-      {open && <div style={{ padding: "0 14px 14px", borderTop: "1px solid #222" }}>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "5px", margin: "10px 0" }}>
-          {q.options?.map((opt, j) => (<div key={j} style={{ padding: "6px 10px", borderRadius: "7px", fontSize: "12px", background: j === q.answer ? "#39FF1422" : "#111", border: `1px solid ${j === q.answer ? "#39FF14" : "#222"}`, color: j === q.answer ? "#39FF14" : "#888" }}><strong>{labels[j]}.</strong> {opt}</div>))}
-        </div>
-        <div style={{ display: "flex", gap: "8px" }}>
-          <button style={{ ...S.btn("secondary", "sm"), flex: 1 }} onClick={onEdit}>✏️ Bewerken</button>
-          <button style={{ ...S.btn("danger", "sm"), flex: 1 }} onClick={onDelete}>🗑 Verwijderen</button>
-        </div>
-      </div>}
-    </div>
-  );
-}
-
-// ── QUESTION FORM ─────────────────────────────────────────────────────────
-function QuestionForm({ initial, type, onSave, onCancel }) {
-  const [q, setQ] = useState(initial?.q || "");
-  const [options, setOptions] = useState(initial?.options || ["", "", "", ""]);
-  const [answer, setAnswer] = useState(initial?.answer ?? 0);
-  const [err, setErr] = useState("");
-  const labels = ["A", "B", "C", "D"];
-  const save = () => {
-    if (!q.trim()) { setErr("Vul een vraag in."); return; }
-    if (options.some(o => !o.trim())) { setErr("Vul alle antwoordopties in."); return; }
-    onSave({ q: q.trim(), options: options.map(o => o.trim()), answer, roundType: type, track: initial?.track || null });
-  };
-  return (
-    <div style={{ background: "#1A1A1A", border: "1px solid #2A2A2A", borderRadius: "16px", padding: "18px" }}>
-      <div style={{ fontSize: "16px", fontWeight: 700, marginBottom: "14px" }}>{initial?.q ? "Vraag bewerken" : "Nieuwe vraag"}</div>
-      {initial?.track && <div style={{ display: "flex", gap: "10px", alignItems: "center", background: "#111", borderRadius: "8px", padding: "10px", marginBottom: "12px" }}>{initial.track.cover && <img src={initial.track.cover} alt="" style={{ width: "40px", height: "40px", borderRadius: "5px", objectFit: "cover" }} />}<div style={{ flex: 1 }}><div style={{ fontWeight: 700, fontSize: "13px" }}>{initial.track.title}</div><div style={{ color: "#555", fontSize: "11px" }}>{initial.track.artist} · {initial.track.year}</div></div></div>}
-      <label style={S.label}>Vraag</label>
-      <textarea style={{ ...S.input, minHeight: "72px", resize: "vertical", marginBottom: "14px", lineHeight: 1.5 }} value={q} onChange={e => setQ(e.target.value)} placeholder="Typ hier je vraag..." />
-      <label style={S.label}>Antwoordopties (● = correct)</label>
-      <div style={{ display: "flex", flexDirection: "column", gap: "7px", marginBottom: "14px" }}>
-        {options.map((opt, i) => (<div key={i} style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-          <div onClick={() => setAnswer(i)} style={{ width: "20px", height: "20px", borderRadius: "50%", border: `2px solid ${answer === i ? "#FFD700" : "#444"}`, background: answer === i ? "#FFD700" : "transparent", cursor: "pointer", flexShrink: 0 }} />
-          <div style={{ width: "20px", fontSize: "12px", color: "#666", fontWeight: 700, flexShrink: 0 }}>{labels[i]}</div>
-          <input style={{ ...S.input, flex: 1 }} value={opt} onChange={e => { const o = [...options]; o[i] = e.target.value; setOptions(o); }} placeholder={`Optie ${labels[i]}`} />
-        </div>))}
-      </div>
-      {err && <div style={{ color: "#FF3B5C", fontSize: "12px", marginBottom: "10px" }}>{err}</div>}
-      <div style={{ display: "flex", gap: "8px" }}>
-        <button style={{ ...S.btn("primary"), flex: 1 }} onClick={save}>💾 Opslaan</button>
-        <button style={{ ...S.btn("secondary"), flex: 1 }} onClick={onCancel}>Annuleren</button>
-      </div>
-    </div>
-  );
-}
-
-// ── SPOTIFY ADDER ─────────────────────────────────────────────────────────
-function SpotifyAdder({ spotifyCreds, onAdd, onCancel }) {
-  const [url, setUrl] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-  const [track, setTrack] = useState(null);
-  const [playing, setPlaying] = useState(false);
-  const [qText, setQText] = useState("");
-  const [options, setOptions] = useState(["", "", "", ""]);
-  const [answer, setAnswer] = useState(0);
-  const audioRef = useRef(null);
-
-  const lookup = async () => {
-    const id = extractSpotifyId(url);
-    if (!id) { setError("Geen geldige URL of ID."); return; }
-    if (!spotifyCreds.clientId) { setError("Spotify credentials ontbreken. Check .env.local"); return; }
-    setLoading(true); setError(""); setTrack(null);
-    try {
-      const t = await fetchSpotifyTrack(id, spotifyCreds.clientId, spotifyCreds.clientSecret);
-      setTrack(t); setQText(`🎵 Welk jaar verscheen "${t.title}" van ${t.artist}?`);
-      const yr = parseInt(t.year);
-      if (yr) { const pool = [yr - 3, yr - 2, yr - 1, yr, yr + 1, yr + 2].filter(y => y > 1950 && y <= new Date().getFullYear()); const wrong = pool.filter(y => y !== yr).sort(() => Math.random() - 0.5).slice(0, 3); const opts = [...wrong, yr].sort(() => Math.random() - 0.5); setOptions(opts.map(String)); setAnswer(opts.indexOf(yr)); }
-    } catch (e) { setError(e.message); }
-    setLoading(false);
-  };
-
-  return (
-    <div style={{ background: "#1A1A1A", border: "1px solid #2A2A2A", borderRadius: "16px", padding: "18px" }}>
-      <div style={{ fontSize: "16px", fontWeight: 700, marginBottom: "14px" }}>🎵 Track via Spotify</div>
-      <div style={{ display: "flex", gap: "8px", marginBottom: "10px" }}>
-        <input style={{ ...S.input, flex: 1, fontSize: "13px" }} placeholder="Spotify URL of track ID" value={url} onChange={e => setUrl(e.target.value)} onKeyDown={e => e.key === "Enter" && lookup()} />
-        <button style={S.btn("primary", "sm")} onClick={lookup} disabled={loading}>{loading ? "..." : "Zoek"}</button>
-      </div>
-      {error && <div style={{ color: "#FF3B5C", fontSize: "12px", marginBottom: "8px" }}>{error}</div>}
-      {track && (<>
-        <div style={{ display: "flex", gap: "12px", alignItems: "center", background: "#111", borderRadius: "8px", padding: "10px", marginBottom: "12px" }}>
-          {track.cover && <img src={track.cover} alt="" style={{ width: "52px", height: "52px", borderRadius: "6px", objectFit: "cover" }} />}
-          <div><div style={{ fontWeight: 700, fontSize: "14px" }}>{track.title}</div><div style={{ color: "#888", fontSize: "12px" }}>{track.artist} · {track.year}</div></div>
-          {track.previewUrl && <button style={{ ...S.btn(playing ? "danger" : "secondary", "sm"), marginLeft: "auto" }} onClick={() => { if (!audioRef.current) return; if (playing) { audioRef.current.pause(); setPlaying(false); } else { audioRef.current.play(); setPlaying(true); } }}>{playing ? "⏸" : "▶"}</button>}
-        </div>
-        {track.previewUrl && <audio ref={audioRef} src={track.previewUrl} onEnded={() => setPlaying(false)} />}
-        <label style={S.label}>Vraagtekst</label>
-        <input style={{ ...S.input, fontSize: "13px", marginBottom: "10px" }} value={qText} onChange={e => setQText(e.target.value)} />
-        <label style={S.label}>Opties (● = correct)</label>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px", marginBottom: "12px" }}>
-          {options.map((opt, i) => (<div key={i} style={{ display: "flex", gap: "6px", alignItems: "center" }}>
-            <div onClick={() => setAnswer(i)} style={{ width: "16px", height: "16px", borderRadius: "50%", border: `2px solid ${answer === i ? "#FFD700" : "#444"}`, background: answer === i ? "#FFD700" : "transparent", cursor: "pointer", flexShrink: 0 }} />
-            <input style={{ ...S.input, fontSize: "12px", padding: "6px 10px" }} value={opt} onChange={e => { const o = [...options]; o[i] = e.target.value; setOptions(o); }} />
-          </div>))}
-        </div>
-        <button style={{ ...S.btn("primary"), width: "100%", marginBottom: "8px" }} onClick={() => { if (!track || !qText.trim()) return; onAdd({ q: qText, options: options.map((o, i) => o || `Optie ${i + 1}`), answer, roundType: "muziek", track }); }}>+ Opslaan in vragenbank</button>
-      </>)}
-      <button style={{ ...S.btn("secondary"), width: "100%" }} onClick={onCancel}>Annuleren</button>
-    </div>
-  );
-}
-
-// ── IN-GAME BANK TAB ──────────────────────────────────────────────────────
-function InGameBankTab({ vragenbank, saveAndSetBank, spotifyCreds }) {
-  const [activeTab, setActiveTab] = useState("kennis");
-  const [showAdd, setShowAdd] = useState(false);
-  const [showSpotify, setShowSpotify] = useState(false);
-  const rl = ROUND_LABELS;
-  const addQ = (q) => { saveAndSetBank({ ...vragenbank, [activeTab]: [...vragenbank[activeTab], { ...q, id: Date.now() }] }); setShowAdd(false); setShowSpotify(false); };
-  const removeQ = (i) => { saveAndSetBank({ ...vragenbank, [activeTab]: vragenbank[activeTab].filter((_, j) => j !== i) }); };
-  return (
-    <div>
-      <div style={{ display: "flex", gap: "6px", marginBottom: "12px" }}>
-        {["kennis", "blitz", "muziek"].map(t => (<button key={t} onClick={() => { setActiveTab(t); setShowAdd(false); setShowSpotify(false); }} style={{ ...S.btn(activeTab === t ? "primary" : "secondary", "sm"), flex: 1, flexDirection: "column", gap: "2px", padding: "8px 4px" }}><span style={{ fontSize: "16px" }}>{rl[t].icon}</span><span style={{ fontSize: "9px" }}>{rl[t].label} ({vragenbank[t].length})</span></button>))}
-      </div>
-      {!showAdd && !showSpotify && (<>
-        <div style={{ display: "flex", gap: "6px", marginBottom: "10px" }}>
-          <button style={{ ...S.btn("primary", "sm"), flex: 1 }} onClick={() => setShowAdd(true)}>+ Vraag</button>
-          {activeTab === "muziek" && <button style={{ ...S.btn("secondary", "sm"), flex: 1 }} onClick={() => setShowSpotify(true)}>🎵 Spotify</button>}
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: "7px" }}>
-          {vragenbank[activeTab].length === 0 ? <div style={{ color: "#333", fontSize: "13px", textAlign: "center", padding: "20px" }}>Geen vragen — voeg er een toe!</div>
-            : vragenbank[activeTab].map((q, i) => (<div key={q.id || i} style={{ display: "flex", gap: "10px", alignItems: "center", padding: "10px 13px", borderRadius: "10px", background: "#111", border: "1px solid #2A2A2A" }}>
-              {q.track?.cover && <img src={q.track.cover} alt="" style={{ width: "34px", height: "34px", borderRadius: "5px", objectFit: "cover", flexShrink: 0 }} />}
-              <div style={{ flex: 1, minWidth: 0 }}><div style={{ fontSize: "12px", lineHeight: 1.4, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{q.q}</div>{q.track && <div style={{ fontSize: "10px", color: "#555" }}>{q.track.artist}</div>}</div>
-              <button style={{ ...S.btn("danger", "sm"), padding: "4px 8px", fontSize: "12px" }} onClick={() => removeQ(i)}>✕</button>
-            </div>))}
-        </div>
-      </>)}
-      {showAdd && <QuestionForm initial={null} type={activeTab} onSave={addQ} onCancel={() => setShowAdd(false)} />}
-      {showSpotify && <SpotifyAdder spotifyCreds={spotifyCreds} onAdd={addQ} onCancel={() => setShowSpotify(false)} />}
-    </div>
-  );
-}
-
-// ── INSTELLINGEN ──────────────────────────────────────────────────────────
-function SpotifyCredsTab() {
-  return (
-    <div style={{ background: "#1A1A1A", border: "1px solid #2A2A2A", borderRadius: "16px", padding: "20px" }}>
-      <div style={{ fontSize: "16px", fontWeight: 700, marginBottom: "8px" }}>⚙️ Instellingen</div>
-      <div style={{ background: "#111", borderRadius: "8px", padding: "14px", fontSize: "13px", color: "#888", lineHeight: 1.7 }}>
-        <div style={{ marginBottom: "8px" }}>Spotify credentials worden geladen vanuit je <code style={{ color: "#FFD700" }}>.env.local</code> bestand.</div>
-        <div style={{ marginBottom: "8px" }}>In productie (Vercel) zet je ze als <strong>Environment Variables</strong>:</div>
-        <div style={{ fontFamily: "monospace", fontSize: "11px", color: "#555", lineHeight: 2 }}>
-          VITE_SPOTIFY_CLIENT_ID<br />
-          VITE_SPOTIFY_CLIENT_SECRET<br />
-          VITE_SUPABASE_URL<br />
-          VITE_SUPABASE_ANON_KEY
-        </div>
-      </div>
-    </div>
-  );
-}
-
 // ── JOIN FLOW ─────────────────────────────────────────────────────────────
-function JoinView({ onJoined, onBack, gameCode, setGameCode, multiplayerMode, setMultiplayerMode }) {
-  const [step, setStep] = useState(1);
-  const [inputCode, setInputCode] = useState("");
+function JoinView({ prefilledCode, onJoinCode, onJoined, onBack }) {
+  const [step, setStep] = useState(prefilledCode ? 2 : 1);
+  const [inputCode, setInputCode] = useState(prefilledCode || "");
   const [name, setName] = useState("");
   const [color, setColor] = useState(COLORS[Math.floor(Math.random() * COLORS.length)]);
   const [emoji, setEmoji] = useState(EMOJIS[Math.floor(Math.random() * EMOJIS.length)]);
   const [err, setErr] = useState("");
 
-  // Check URL hash for QR join
   useEffect(() => {
-    const hash = window.location.hash.replace("#", "");
-    if (hash.startsWith("join-")) {
-      const code = hash.replace("join-", "").toUpperCase();
-      setInputCode(code);
-      setGameCode(code);
-      setStep(2);
-      window.location.hash = "";
+    if (prefilledCode) {
+      onJoinCode(prefilledCode);
     }
   }, []);
 
-  const join = () => {
+  const handleCodeSubmit = () => {
+    if (!inputCode.trim()) { setErr("Vul een code in."); return; }
+    onJoinCode(inputCode.toUpperCase());
+    setErr(""); setStep(2);
+  };
+
+  const handleJoin = () => {
     if (!name.trim()) { setErr("Vul een teamnaam in."); return; }
-    onJoined({ id: Date.now(), name: name.trim(), color: color.value, emoji });
+    const team = { id: Date.now(), name: name.trim(), color: color.value, emoji, score: 0 };
+    onJoined(team);
   };
 
   return (
@@ -739,17 +607,12 @@ function JoinView({ onJoined, onBack, gameCode, setGameCode, multiplayerMode, se
           {step === 1 && <>
             <div style={{ fontSize: "17px", fontWeight: 700, marginBottom: "14px" }}>🎮 Code invoeren</div>
             <input style={{ ...S.input, fontSize: "28px", letterSpacing: "0.35em", textAlign: "center", marginBottom: "12px" }} placeholder="XXXXX" maxLength={5} value={inputCode} onChange={e => setInputCode(e.target.value.toUpperCase())} />
-            <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "12px", padding: "10px", background: "#111", borderRadius: "8px" }}>
-              <div onClick={() => setMultiplayerMode(!multiplayerMode)} style={{ width: "36px", height: "20px", borderRadius: "10px", background: multiplayerMode ? "#FFD700" : "#333", cursor: "pointer", position: "relative", flexShrink: 0 }}>
-                <div style={{ position: "absolute", top: "2px", left: multiplayerMode ? "18px" : "2px", width: "16px", height: "16px", borderRadius: "50%", background: multiplayerMode ? "#0D0D0D" : "#888", transition: "left 0.2s" }} />
-              </div>
-              <span style={{ fontSize: "12px", color: "#555" }}>Multiplayer (andere apparaten)</span>
-            </div>
             {err && <div style={{ color: "#FF3B5C", fontSize: "13px", marginBottom: "8px" }}>{err}</div>}
-            <button style={{ ...S.btn("primary"), width: "100%", marginBottom: "8px" }} onClick={() => { if (inputCode.trim()) { setGameCode(inputCode.toUpperCase()); setErr(""); setStep(2); } else setErr("Vul een code in."); }}>Verder →</button>
+            <button style={{ ...S.btn("primary"), width: "100%", marginBottom: "8px" }} onClick={handleCodeSubmit}>Verder →</button>
             <button style={{ ...S.btn("secondary"), width: "100%" }} onClick={onBack}>← Terug</button>
           </>}
           {step === 2 && <>
+            {prefilledCode && <div style={{ ...S.tag("#39FF14"), marginBottom: "14px", fontSize: "11px" }}>✓ Code {prefilledCode} herkend via QR</div>}
             <div style={{ fontSize: "17px", fontWeight: 700, marginBottom: "14px" }}>🏆 Maak je team aan</div>
             <label style={S.label}>Teamnaam</label>
             <input style={{ ...S.input, fontSize: "17px", marginBottom: "14px" }} placeholder="bv. De Vinylkrakers" maxLength={20} value={name} onChange={e => setName(e.target.value)} autoFocus />
@@ -759,7 +622,7 @@ function JoinView({ onJoined, onBack, gameCode, setGameCode, multiplayerMode, se
             <div style={{ display: "flex", flexWrap: "wrap", gap: "5px", marginBottom: "14px" }}>{EMOJIS.map(em => <div key={em} onClick={() => setEmoji(em)} style={{ padding: "5px", borderRadius: "7px", cursor: "pointer", fontSize: "22px", background: emoji === em ? "#2A2A2A" : "transparent", border: emoji === em ? "1px solid #FFD700" : "1px solid transparent" }}>{em}</div>)}</div>
             {name && <div style={{ marginBottom: "14px" }}><TeamChip team={{ name, color: color.value, emoji, score: 0 }} /></div>}
             {err && <div style={{ color: "#FF3B5C", fontSize: "13px", marginBottom: "8px" }}>{err}</div>}
-            <button style={{ ...S.btn("primary", "lg"), width: "100%" }} onClick={join}>🎉 Joinen!</button>
+            <button style={{ ...S.btn("primary", "lg"), width: "100%" }} onClick={handleJoin}>🎉 Joinen!</button>
           </>}
         </div>
       </div>
@@ -768,14 +631,26 @@ function JoinView({ onJoined, onBack, gameCode, setGameCode, multiplayerMode, se
 }
 
 // ── PLAYER VIEW ───────────────────────────────────────────────────────────
-function PlayerView({ myTeamId, tick, submitAnswer }) {
-  const g = G();
-  const myTeam = g.teams.find(t => t.id === myTeamId);
+function PlayerView({ myTeam, g, submitAnswer }) {
   const [answered, setAnswered] = useState(null);
   const labels = ["A", "B", "C", "D"];
-  useEffect(() => { if (g.phase === "question") setAnswered(null); }, [g.phase]);
-  const submit = idx => { if (answered !== null) return; setAnswered(idx); submitAnswer(myTeamId, idx); };
+  const prevPhase = useRef(g.phase);
+
+  useEffect(() => {
+    if (prevPhase.current !== "question" && g.phase === "question") setAnswered(null);
+    prevPhase.current = g.phase;
+  }, [g.phase]);
+
+  const submit = idx => {
+    if (answered !== null) return;
+    setAnswered(idx);
+    submitAnswer(myTeam.id, idx);
+  };
+
+  const me = g.teams.find(t => t.id === myTeam?.id) || myTeam;
   if (!myTeam) return null;
+  if (g.gameOver || g.phase === "gameover") return <EndScreen teams={g.teams} onRestart={() => { }} />;
+
   return (
     <div style={S.app}><div style={S.grain} />
       <div style={S.center}>
@@ -783,7 +658,7 @@ function PlayerView({ myTeamId, tick, submitAnswer }) {
           <div style={{ ...S.card, textAlign: "center" }}>
             <div style={{ fontSize: "56px", marginBottom: "8px" }}>{myTeam.emoji}</div>
             <div style={{ fontSize: "24px", fontWeight: 700, color: myTeam.color, marginBottom: "4px" }}>{myTeam.name}</div>
-            <div style={{ color: "#555", fontSize: "13px", marginBottom: "20px" }}>{myTeam.score} punten</div>
+            <div style={{ color: "#555", fontSize: "13px", marginBottom: "20px" }}>{me?.score ?? 0} punten</div>
             <div style={{ background: "#111", borderRadius: "10px", padding: "18px", color: "#444", fontSize: "13px" }}>
               ⏳ Wacht op de host...
               <div style={{ display: "flex", justifyContent: "center", gap: "6px", marginTop: "10px" }}>
@@ -817,7 +692,7 @@ function PlayerView({ myTeamId, tick, submitAnswer }) {
               ? <><div style={{ fontSize: "60px" }}>🎉</div><div style={{ fontSize: "22px", fontWeight: 700, color: "#39FF14", marginBottom: "6px" }}>Goed!</div><div style={{ color: "#555" }}>+{ROUND_POINTS[g.currentQ.roundType]} punten</div></>
               : <><div style={{ fontSize: "60px" }}>😬</div><div style={{ fontSize: "22px", fontWeight: 700, color: "#FF3B5C", marginBottom: "6px" }}>{answered === null ? "Geen antwoord" : "Fout!"}</div><div style={{ color: "#555", fontSize: "13px" }}>Correct: {g.currentQ.options?.[g.currentQ.answer]}</div></>
             }
-            <div style={{ marginTop: "16px", padding: "12px", background: "#111", borderRadius: "8px", fontSize: "20px", fontWeight: 700, color: myTeam.color }}>{myTeam.score} punten</div>
+            <div style={{ marginTop: "16px", padding: "12px", background: "#111", borderRadius: "8px", fontSize: "20px", fontWeight: 700, color: myTeam.color }}>{me?.score ?? 0} punten</div>
           </div>
         )}
       </div>
@@ -827,13 +702,13 @@ function PlayerView({ myTeamId, tick, submitAnswer }) {
 }
 
 // ── BIG SCREEN ────────────────────────────────────────────────────────────
-function BigScreen({ code, tick, onBack, onEndGame }) {
-  const g = G();
+function BigScreen({ code, g, onBack, onEndGame }) {
   const sorted = [...g.teams].sort((a, b) => b.score - a.score);
   const maxScore = Math.max(...g.teams.map(t => t.score), 1);
   const medals = ["🥇", "🥈", "🥉"];
   const labels = ["A", "B", "C", "D"];
   const joinUrl = `${window.location.origin}/#join-${code}`;
+  if (g.gameOver || g.phase === "gameover") return <EndScreen teams={g.teams} onRestart={onBack} />;
   return (
     <div style={{ ...S.app, minHeight: "100vh" }}><div style={S.grain} />
       <div style={{ padding: "24px 36px" }}>
@@ -850,6 +725,7 @@ function BigScreen({ code, tick, onBack, onEndGame }) {
             <button style={S.btn("danger", "sm")} onClick={onEndGame}>🏁 Einde</button>
           </div>
         </div>
+
         {g.phase === "question" && g.currentQ && (
           <div style={{ background: "#1A1A1A", border: "1px solid #2A2A2A", borderRadius: "16px", padding: "20px", marginBottom: "18px" }}>
             <div style={{ display: "flex", gap: "16px", alignItems: "flex-start" }}>
@@ -864,12 +740,14 @@ function BigScreen({ code, tick, onBack, onEndGame }) {
             <div style={{ marginTop: "10px", color: "#444", fontSize: "12px", textAlign: "right" }}>{Object.keys(g.answers).length}/{g.teams.length} antwoorden</div>
           </div>
         )}
+
         {g.phase === "reveal" && g.currentQ && (
           <div style={{ background: "#1A1A1A", border: "1px solid #39FF1444", borderRadius: "16px", padding: "16px", marginBottom: "18px", textAlign: "center" }}>
             {g.currentQ.track && (<div style={{ display: "flex", gap: "14px", alignItems: "center", justifyContent: "center", marginBottom: "8px" }}>{g.currentQ.track.cover && <img src={g.currentQ.track.cover} alt="" style={{ width: "56px", height: "56px", borderRadius: "6px", objectFit: "cover" }} />}<div style={{ textAlign: "left" }}><div style={{ fontWeight: 700, fontSize: "18px" }}>{g.currentQ.track.title}</div><div style={{ color: "#888", fontSize: "13px" }}>{g.currentQ.track.artist} · {g.currentQ.track.year}</div></div></div>)}
             <div style={{ color: "#39FF14", fontSize: "13px", letterSpacing: "0.2em" }}>✓ CORRECT: {labels[g.currentQ.answer]}. {g.currentQ.options?.[g.currentQ.answer]}</div>
           </div>
         )}
+
         <div style={S.label}>🏆 Scorebord</div>
         {sorted.length === 0
           ? <div style={{ textAlign: "center", padding: "40px", color: "#333" }}><div style={{ fontSize: "48px", marginBottom: "10px" }}>📱</div>Scan de QR code om mee te doen!</div>
@@ -892,7 +770,153 @@ function BigScreen({ code, tick, onBack, onEndGame }) {
   );
 }
 
-// ── TEAM CHIP ─────────────────────────────────────────────────────────────
+// ── VRAGENBANK ────────────────────────────────────────────────────────────
+function VragenBankScreen({ vragenbank, saveAndSetBank, spotifyCreds, onBack }) {
+  const [activeTab, setActiveTab] = useState("kennis");
+  const [editQ, setEditQ] = useState(null);
+  const [showSpotify, setShowSpotify] = useState(false);
+  const rl = ROUND_LABELS;
+  const addQuestion = (q) => { saveAndSetBank({ ...vragenbank, [activeTab]: [...vragenbank[activeTab], { ...q, id: Date.now() }] }); setEditQ(null); setShowSpotify(false); };
+  const updateQuestion = (idx, q) => { const arr = [...vragenbank[activeTab]]; arr[idx] = { ...q, id: arr[idx].id }; saveAndSetBank({ ...vragenbank, [activeTab]: arr }); setEditQ(null); };
+  const deleteQuestion = (idx) => { saveAndSetBank({ ...vragenbank, [activeTab]: vragenbank[activeTab].filter((_, i) => i !== idx) }); };
+  const moveQuestion = (idx, dir) => { const arr = [...vragenbank[activeTab]]; const to = idx + dir; if (to < 0 || to >= arr.length) return; [arr[idx], arr[to]] = [arr[to], arr[idx]]; saveAndSetBank({ ...vragenbank, [activeTab]: arr }); };
+  return (
+    <div style={{ ...S.app, paddingBottom: "20px" }}><div style={S.grain} />
+      <div style={{ padding: "16px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "16px" }}>
+          <button style={S.btn("ghost", "sm")} onClick={onBack}>←</button>
+          <div style={S.logoSm}>Vragenbank</div>
+          <div style={{ marginLeft: "auto", fontSize: "12px", color: "#555" }}>{Object.values(vragenbank).flat().length} vragen</div>
+        </div>
+        <div style={{ display: "flex", gap: "6px", marginBottom: "16px" }}>
+          {["kennis", "blitz", "muziek"].map(t => (<button key={t} onClick={() => { setActiveTab(t); setEditQ(null); setShowSpotify(false); }} style={{ ...S.btn(activeTab === t ? "primary" : "secondary", "sm"), flex: 1, flexDirection: "column", gap: "2px", padding: "10px 4px" }}><span style={{ fontSize: "18px" }}>{rl[t].icon}</span><span style={{ fontSize: "10px" }}>{rl[t].label} ({vragenbank[t].length})</span></button>))}
+        </div>
+        {editQ === null && !showSpotify && (<>
+          <div style={{ display: "flex", gap: "8px", marginBottom: "12px" }}>
+            <button style={{ ...S.btn("primary", "sm"), flex: 1 }} onClick={() => setEditQ("new")}>+ Nieuwe vraag</button>
+            {activeTab === "muziek" && <button style={{ ...S.btn("secondary", "sm"), flex: 1 }} onClick={() => setShowSpotify(true)}>🎵 Via Spotify</button>}
+          </div>
+          {vragenbank[activeTab].length === 0
+            ? <div style={{ textAlign: "center", padding: "40px 20px", color: "#333" }}><div style={{ fontSize: "40px", marginBottom: "12px" }}>{rl[activeTab].icon}</div><div>Nog geen vragen — voeg er een toe!</div></div>
+            : <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>{vragenbank[activeTab].map((q, i) => (<QuestionCard key={q.id || i} q={q} i={i} total={vragenbank[activeTab].length} onEdit={() => setEditQ({ ...q, index: i })} onDelete={() => deleteQuestion(i)} onMove={dir => moveQuestion(i, dir)} />))}</div>}
+        </>)}
+        {(editQ === "new" || (editQ && editQ.index !== undefined)) && <QuestionForm initial={editQ === "new" ? null : editQ} type={activeTab} onSave={q => editQ === "new" ? addQuestion(q) : updateQuestion(editQ.index, q)} onCancel={() => setEditQ(null)} />}
+        {showSpotify && activeTab === "muziek" && <SpotifyAdder spotifyCreds={spotifyCreds} onAdd={q => { addQuestion(q); }} onCancel={() => setShowSpotify(false)} />}
+      </div>
+    </div>
+  );
+}
+
+function QuestionCard({ q, i, total, onEdit, onDelete, onMove }) {
+  const [open, setOpen] = useState(false);
+  const labels = ["A", "B", "C", "D"];
+  return (
+    <div style={{ background: "#1A1A1A", border: "1px solid #2A2A2A", borderRadius: "12px", overflow: "hidden" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "10px", padding: "12px 14px", cursor: "pointer" }} onClick={() => setOpen(!open)}>
+        <div style={{ width: "22px", height: "22px", borderRadius: "50%", background: "#2A2A2A", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "11px", color: "#666", flexShrink: 0, fontWeight: 700 }}>{i + 1}</div>
+        {q.track?.cover && <img src={q.track.cover} alt="" style={{ width: "36px", height: "36px", borderRadius: "5px", objectFit: "cover", flexShrink: 0 }} />}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: "13px", fontWeight: 600, lineHeight: 1.4, whiteSpace: open ? "normal" : "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{q.q}</div>
+          {q.track && <div style={{ fontSize: "11px", color: "#555", marginTop: "2px" }}>{q.track.artist} · {q.track.year}</div>}
+        </div>
+        <div style={{ display: "flex", gap: "4px", alignItems: "center", flexShrink: 0 }}>
+          <button style={{ ...S.btn("ghost", "sm"), padding: "4px 6px", opacity: i === 0 ? 0.3 : 1 }} onClick={e => { e.stopPropagation(); onMove(-1); }}>↑</button>
+          <button style={{ ...S.btn("ghost", "sm"), padding: "4px 6px", opacity: i === total - 1 ? 0.3 : 1 }} onClick={e => { e.stopPropagation(); onMove(1); }}>↓</button>
+          <span style={{ fontSize: "14px", color: "#444" }}>{open ? "▲" : "▼"}</span>
+        </div>
+      </div>
+      {open && <div style={{ padding: "0 14px 14px", borderTop: "1px solid #222" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "5px", margin: "10px 0" }}>
+          {q.options?.map((opt, j) => (<div key={j} style={{ padding: "6px 10px", borderRadius: "7px", fontSize: "12px", background: j === q.answer ? "#39FF1422" : "#111", border: `1px solid ${j === q.answer ? "#39FF14" : "#222"}`, color: j === q.answer ? "#39FF14" : "#888" }}><strong>{labels[j]}.</strong> {opt}</div>))}
+        </div>
+        <div style={{ display: "flex", gap: "8px" }}>
+          <button style={{ ...S.btn("secondary", "sm"), flex: 1 }} onClick={onEdit}>✏️ Bewerken</button>
+          <button style={{ ...S.btn("danger", "sm"), flex: 1 }} onClick={onDelete}>🗑 Verwijderen</button>
+        </div>
+      </div>}
+    </div>
+  );
+}
+
+function QuestionForm({ initial, type, onSave, onCancel }) {
+  const [q, setQ] = useState(initial?.q || "");
+  const [options, setOptions] = useState(initial?.options || ["", "", "", ""]);
+  const [answer, setAnswer] = useState(initial?.answer ?? 0);
+  const [err, setErr] = useState("");
+  const labels = ["A", "B", "C", "D"];
+  const save = () => {
+    if (!q.trim()) { setErr("Vul een vraag in."); return; }
+    if (options.some(o => !o.trim())) { setErr("Vul alle antwoordopties in."); return; }
+    onSave({ q: q.trim(), options: options.map(o => o.trim()), answer, roundType: type, track: initial?.track || null });
+  };
+  return (
+    <div style={{ background: "#1A1A1A", border: "1px solid #2A2A2A", borderRadius: "16px", padding: "18px" }}>
+      <div style={{ fontSize: "16px", fontWeight: 700, marginBottom: "14px" }}>{initial?.q ? "Vraag bewerken" : "Nieuwe vraag"}</div>
+      {initial?.track && <div style={{ display: "flex", gap: "10px", alignItems: "center", background: "#111", borderRadius: "8px", padding: "10px", marginBottom: "12px" }}>{initial.track.cover && <img src={initial.track.cover} alt="" style={{ width: "40px", height: "40px", borderRadius: "5px", objectFit: "cover" }} />}<div><div style={{ fontWeight: 700, fontSize: "13px" }}>{initial.track.title}</div><div style={{ color: "#555", fontSize: "11px" }}>{initial.track.artist} · {initial.track.year}</div></div></div>}
+      <label style={S.label}>Vraag</label>
+      <textarea style={{ ...S.input, minHeight: "72px", resize: "vertical", marginBottom: "14px", lineHeight: 1.5 }} value={q} onChange={e => setQ(e.target.value)} placeholder="Typ hier je vraag..." />
+      <label style={S.label}>Antwoordopties (● = correct)</label>
+      <div style={{ display: "flex", flexDirection: "column", gap: "7px", marginBottom: "14px" }}>
+        {options.map((opt, i) => (<div key={i} style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+          <div onClick={() => setAnswer(i)} style={{ width: "20px", height: "20px", borderRadius: "50%", border: `2px solid ${answer === i ? "#FFD700" : "#444"}`, background: answer === i ? "#FFD700" : "transparent", cursor: "pointer", flexShrink: 0 }} />
+          <div style={{ width: "20px", fontSize: "12px", color: "#666", fontWeight: 700, flexShrink: 0 }}>{labels[i]}</div>
+          <input style={{ ...S.input, flex: 1 }} value={opt} onChange={e => { const o = [...options]; o[i] = e.target.value; setOptions(o); }} placeholder={`Optie ${labels[i]}`} />
+        </div>))}
+      </div>
+      {err && <div style={{ color: "#FF3B5C", fontSize: "12px", marginBottom: "10px" }}>{err}</div>}
+      <div style={{ display: "flex", gap: "8px" }}>
+        <button style={{ ...S.btn("primary"), flex: 1 }} onClick={save}>💾 Opslaan</button>
+        <button style={{ ...S.btn("secondary"), flex: 1 }} onClick={onCancel}>Annuleren</button>
+      </div>
+    </div>
+  );
+}
+
+function SpotifyAdder({ spotifyCreds, onAdd, onCancel }) {
+  const [url, setUrl] = useState(""); const [loading, setLoading] = useState(false); const [error, setError] = useState(""); const [track, setTrack] = useState(null); const [playing, setPlaying] = useState(false); const [qText, setQText] = useState(""); const [options, setOptions] = useState(["", "", "", ""]); const [answer, setAnswer] = useState(0); const audioRef = useRef(null);
+  const lookup = async () => { const id = extractSpotifyId(url); if (!id) { setError("Geen geldige URL of ID."); return; } if (!spotifyCreds.clientId) { setError("Spotify credentials ontbreken."); return; } setLoading(true); setError(""); setTrack(null); try { const t = await fetchSpotifyTrack(id, spotifyCreds.clientId, spotifyCreds.clientSecret); setTrack(t); setQText(`🎵 Welk jaar verscheen "${t.title}" van ${t.artist}?`); const yr = parseInt(t.year); if (yr) { const pool = [yr - 3, yr - 2, yr - 1, yr, yr + 1, yr + 2].filter(y => y > 1950 && y <= new Date().getFullYear()); const wrong = pool.filter(y => y !== yr).sort(() => Math.random() - 0.5).slice(0, 3); const opts = [...wrong, yr].sort(() => Math.random() - 0.5); setOptions(opts.map(String)); setAnswer(opts.indexOf(yr)); } } catch (e) { setError(e.message); } setLoading(false); };
+  return (
+    <div style={{ background: "#1A1A1A", border: "1px solid #2A2A2A", borderRadius: "16px", padding: "18px" }}>
+      <div style={{ fontSize: "16px", fontWeight: 700, marginBottom: "14px" }}>🎵 Track via Spotify</div>
+      <div style={{ display: "flex", gap: "8px", marginBottom: "10px" }}><input style={{ ...S.input, flex: 1, fontSize: "13px" }} placeholder="Spotify URL of track ID" value={url} onChange={e => setUrl(e.target.value)} onKeyDown={e => e.key === "Enter" && lookup()} /><button style={S.btn("primary", "sm")} onClick={lookup} disabled={loading}>{loading ? "..." : "Zoek"}</button></div>
+      {error && <div style={{ color: "#FF3B5C", fontSize: "12px", marginBottom: "8px" }}>{error}</div>}
+      {track && (<><div style={{ display: "flex", gap: "12px", alignItems: "center", background: "#111", borderRadius: "8px", padding: "10px", marginBottom: "12px" }}>{track.cover && <img src={track.cover} alt="" style={{ width: "52px", height: "52px", borderRadius: "6px", objectFit: "cover" }} />}<div><div style={{ fontWeight: 700, fontSize: "14px" }}>{track.title}</div><div style={{ color: "#888", fontSize: "12px" }}>{track.artist} · {track.year}</div></div>{track.previewUrl && <button style={{ ...S.btn(playing ? "danger" : "secondary", "sm"), marginLeft: "auto" }} onClick={() => { if (!audioRef.current) return; if (playing) { audioRef.current.pause(); setPlaying(false); } else { audioRef.current.play(); setPlaying(true); } }}>{playing ? "⏸" : "▶"}</button>}</div>
+        {track.previewUrl && <audio ref={audioRef} src={track.previewUrl} onEnded={() => setPlaying(false)} />}
+        <label style={S.label}>Vraagtekst</label><input style={{ ...S.input, fontSize: "13px", marginBottom: "10px" }} value={qText} onChange={e => setQText(e.target.value)} />
+        <label style={S.label}>Opties (● = correct)</label>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px", marginBottom: "12px" }}>{options.map((opt, i) => (<div key={i} style={{ display: "flex", gap: "6px", alignItems: "center" }}><div onClick={() => setAnswer(i)} style={{ width: "16px", height: "16px", borderRadius: "50%", border: `2px solid ${answer === i ? "#FFD700" : "#444"}`, background: answer === i ? "#FFD700" : "transparent", cursor: "pointer", flexShrink: 0 }} /><input style={{ ...S.input, fontSize: "12px", padding: "6px 10px" }} value={opt} onChange={e => { const o = [...options]; o[i] = e.target.value; setOptions(o); }} /></div>))}</div>
+        <button style={{ ...S.btn("primary"), width: "100%", marginBottom: "8px" }} onClick={() => { if (!track || !qText.trim()) return; onAdd({ q: qText, options: options.map((o, i) => o || `Optie ${i + 1}`), answer, roundType: "muziek", track }); }}>+ Opslaan in vragenbank</button></>)}
+      <button style={{ ...S.btn("secondary"), width: "100%" }} onClick={onCancel}>Annuleren</button>
+    </div>
+  );
+}
+
+function InGameBankTab({ vragenbank, saveAndSetBank, spotifyCreds }) {
+  const [activeTab, setActiveTab] = useState("kennis"); const [showAdd, setShowAdd] = useState(false); const [showSpotify, setShowSpotify] = useState(false); const rl = ROUND_LABELS;
+  const addQ = (q) => { saveAndSetBank({ ...vragenbank, [activeTab]: [...vragenbank[activeTab], { ...q, id: Date.now() }] }); setShowAdd(false); setShowSpotify(false); };
+  const removeQ = (i) => { saveAndSetBank({ ...vragenbank, [activeTab]: vragenbank[activeTab].filter((_, j) => j !== i) }); };
+  return (
+    <div>
+      <div style={{ display: "flex", gap: "6px", marginBottom: "12px" }}>{["kennis", "blitz", "muziek"].map(t => (<button key={t} onClick={() => { setActiveTab(t); setShowAdd(false); setShowSpotify(false); }} style={{ ...S.btn(activeTab === t ? "primary" : "secondary", "sm"), flex: 1, flexDirection: "column", gap: "2px", padding: "8px 4px" }}><span style={{ fontSize: "16px" }}>{rl[t].icon}</span><span style={{ fontSize: "9px" }}>{rl[t].label} ({vragenbank[t].length})</span></button>))}</div>
+      {!showAdd && !showSpotify && (<><div style={{ display: "flex", gap: "6px", marginBottom: "10px" }}><button style={{ ...S.btn("primary", "sm"), flex: 1 }} onClick={() => setShowAdd(true)}>+ Vraag</button>{activeTab === "muziek" && <button style={{ ...S.btn("secondary", "sm"), flex: 1 }} onClick={() => setShowSpotify(true)}>🎵 Spotify</button>}</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: "7px" }}>{vragenbank[activeTab].length === 0 ? <div style={{ color: "#333", fontSize: "13px", textAlign: "center", padding: "20px" }}>Geen vragen</div> : vragenbank[activeTab].map((q, i) => (<div key={q.id || i} style={{ display: "flex", gap: "10px", alignItems: "center", padding: "10px 13px", borderRadius: "10px", background: "#111", border: "1px solid #2A2A2A" }}>{q.track?.cover && <img src={q.track.cover} alt="" style={{ width: "34px", height: "34px", borderRadius: "5px", objectFit: "cover", flexShrink: 0 }} />}<div style={{ flex: 1, minWidth: 0 }}><div style={{ fontSize: "12px", lineHeight: 1.4, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{q.q}</div>{q.track && <div style={{ fontSize: "10px", color: "#555" }}>{q.track.artist}</div>}</div><button style={{ ...S.btn("danger", "sm"), padding: "4px 8px", fontSize: "12px" }} onClick={() => removeQ(i)}>✕</button></div>))}</div></>)}
+      {showAdd && <QuestionForm initial={null} type={activeTab} onSave={addQ} onCancel={() => setShowAdd(false)} />}
+      {showSpotify && <SpotifyAdder spotifyCreds={spotifyCreds} onAdd={addQ} onCancel={() => setShowSpotify(false)} />}
+    </div>
+  );
+}
+
+function SpotifyCredsTab() {
+  return (
+    <div style={{ background: "#1A1A1A", border: "1px solid #2A2A2A", borderRadius: "16px", padding: "20px" }}>
+      <div style={{ fontSize: "16px", fontWeight: 700, marginBottom: "8px" }}>⚙️ Instellingen</div>
+      <div style={{ background: "#111", borderRadius: "8px", padding: "12px", fontSize: "13px", color: "#888", lineHeight: 1.7 }}>
+        Spotify credentials worden geladen vanuit <code style={{ color: "#FFD700" }}>.env.local</code> (lokaal) of Vercel Environment Variables (productie).
+      </div>
+    </div>
+  );
+}
+
 function TeamChip({ team }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: "10px", padding: "9px 13px", borderRadius: "9px", background: "#111", border: `1px solid ${team.color}33` }}>
